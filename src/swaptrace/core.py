@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
+from swaptrace.pricing import estimate_cost_usd
+
 __all__ = ["Trace", "Attempt", "AttemptOutcome", "TraceStatus"]
 
 AttemptOutcome = Literal["success", "retryable_error", "non_retryable_error"]
@@ -94,18 +96,29 @@ class Attempt:
         *,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
+        pricing_overrides: dict[str, tuple[float, float]] | None = None,
     ) -> None:
-        """Mark this attempt successful and store the token counts.
+        """Mark this attempt successful, store the token counts, and price it.
 
         ``response`` (the provider's response object) is accepted for a stable
-        call signature but not persisted -- there is no field for it. Session 7
-        may read usage figures off it.
+        call signature but not persisted -- there is no field for it.
+
+        ``cost_usd`` is filled in from :func:`swaptrace.pricing.estimate_cost_usd`
+        using this attempt's ``model`` and the token counts; it stays ``None``
+        when the model is not in the pricing table (or either token count is
+        ``None``). ``pricing_overrides`` (``{model: (input_rate, output_rate)}``,
+        USD per 1M tokens) is passed straight through -- keep a local dict in
+        your retry loop and hand it in on each call.
         """
         self.outcome = "success"
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
-        # cost_usd stays None. TODO: Session 7 -- wire in pricing.py to turn the
-        # token counts + provider/model into a dollar figure here.
+        self.cost_usd = estimate_cost_usd(
+            self.model,
+            prompt_tokens,
+            completion_tokens,
+            overrides=pricing_overrides,
+        )
 
     def record_failure(self, error, *, retryable: bool) -> None:
         """Mark this attempt failed, using the caller's own classification.

@@ -17,6 +17,9 @@ from swaptrace import Trace
 PROMPT_TOKENS = 10
 COMPLETION_TOKENS = 20
 
+# Bundled rate for "gpt-4o-mini" is (0.15, 0.60) USD per 1M tokens.
+GPT_4O_MINI_COST = (PROMPT_TOKENS * 0.15 + COMPLETION_TOKENS * 0.60) / 1_000_000
+
 
 class RetryableError(Exception):
     """Stand-in for a caller-owned "try the next provider" exception."""
@@ -35,11 +38,23 @@ def _call(behavior):
     raise AssertionError(f"unknown behavior: {behavior!r}")
 
 
-def run_cascade(behaviors, providers=None, *, classify_unexpected=True, trace=None):
+def run_cascade(
+    behaviors,
+    providers=None,
+    *,
+    classify_unexpected=True,
+    trace=None,
+    model="test-model",
+    pricing_overrides=None,
+):
     """Run the exact Session 3 usage pattern over a list of provider behaviors.
 
     Returns the :class:`Trace`. Pass ``trace=Trace()`` when the cascade is
     expected to raise, so the instance can still be inspected afterwards.
+
+    ``model`` defaults to ``"test-model"`` -- deliberately absent from the
+    pricing table, so ``cost_usd`` stays ``None`` unless a test opts into a
+    real model name and/or ``pricing_overrides``.
     """
     if trace is None:
         trace = Trace()
@@ -48,13 +63,14 @@ def run_cascade(behaviors, providers=None, *, classify_unexpected=True, trace=No
 
     with trace:
         for provider, behavior in zip(providers, behaviors):
-            with trace.attempt(provider=provider, model="test-model") as attempt:
+            with trace.attempt(provider=provider, model=model) as attempt:
                 try:
                     response = _call(behavior)
                     attempt.record_success(
                         response,
                         prompt_tokens=PROMPT_TOKENS,
                         completion_tokens=COMPLETION_TOKENS,
+                        pricing_overrides=pricing_overrides,
                     )
                     break
                 except RetryableError as exc:
@@ -195,3 +211,30 @@ class TestUnclassifiedExceptionDefensivePath:
         assert attempt.error_message is not None
         assert attempt.latency_ms is not None
         assert trace.final_status == "exhausted"
+
+
+class TestCostWiring:
+    """pricing.estimate_cost_usd is wired into Attempt.record_success (Session 7)."""
+
+    def test_bundled_model_cost_computed_end_to_end(self):
+        # gpt-4o-mini @ (0.15, 0.60)/1M with 10 prompt + 20 completion tokens:
+        # (10*0.15 + 20*0.60) / 1_000_000 == 1.35e-5
+        trace = run_cascade(["ok"], providers=["openai"], model="gpt-4o-mini")
+        cost = trace.attempts[0].cost_usd
+        assert isinstance(cost, float)
+        assert cost == pytest.approx(GPT_4O_MINI_COST)
+        assert cost == pytest.approx(1.35e-5)
+        # and it flows into the rollup that used to always be 0.0
+        assert trace.total_cost_usd == pytest.approx(1.35e-5)
+
+    def test_override_threads_through_record_success(self):
+        # A model absent from DEFAULT_PRICING, priced only via the override kwarg:
+        # (10*1000.0 + 20*2000.0) / 1_000_000 == 0.05
+        trace = run_cascade(
+            ["ok"],
+            providers=["x"],
+            model="brand-new-model",
+            pricing_overrides={"brand-new-model": (1000.0, 2000.0)},
+        )
+        assert trace.attempts[0].cost_usd == pytest.approx(0.05)
+        assert trace.total_cost_usd == pytest.approx(0.05)
