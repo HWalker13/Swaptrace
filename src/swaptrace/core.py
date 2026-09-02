@@ -1,10 +1,13 @@
 """Core data model for swaptrace.
 
-Session 2 scope: the :class:`Trace` and :class:`Attempt` dataclasses plus
-*skeleton* context managers. The success / failure / exhaustion branching and
-the roll-up of per-attempt numbers into the parent :class:`Trace` are left as
-``# TODO: Session 3`` markers and ``NotImplementedError`` stubs on purpose --
-Session 3 builds against this, it does not inherit a finished implementation.
+The :class:`Trace` and :class:`Attempt` dataclasses plus their context managers.
+A ``Trace`` records one "swap" sequence -- the ordered attempts made against a
+cascade of providers to get a usable LLM response -- and finalizes a set of
+rolled-up totals when its ``with`` block exits.
+
+swaptrace is framework-agnostic on purpose: it defines no exception hierarchy.
+The caller catches its own errors and classifies each one as retryable or not
+via :meth:`Attempt.record_failure`.
 
 Stdlib only: ``dataclasses``, ``uuid``, ``datetime``, ``typing.Literal``.
 """
@@ -36,13 +39,14 @@ class Attempt:
 
     Created by :meth:`Trace.attempt` and used directly as a context manager::
 
-        with trace.attempt("openai", "gpt-4o") as attempt:
+        with trace.attempt(provider="openai", model="gpt-4o") as attempt:
             response = call_provider(...)
-            attempt.record_success(prompt_tokens=12, completion_tokens=34)
+            attempt.record_success(response, prompt_tokens=12, completion_tokens=34)
 
     ``__enter__`` stamps ``started_at``; ``__exit__`` stamps ``ended_at`` and
-    ``latency_ms``. The remaining fields are populated by
-    :meth:`record_success` / :meth:`record_failure` (Session 3).
+    ``latency_ms``. ``outcome`` and the token / error fields are set by
+    :meth:`record_success` / :meth:`record_failure`, or -- if an exception
+    leaves the block without the caller classifying it -- by ``__exit__``.
 
     Fields are declared in the project spec's data-model order. ``started_at`` /
     ``ended_at`` / ``latency_ms`` / ``outcome`` are typed ``| None`` because the
@@ -74,40 +78,45 @@ class Attempt:
             self.latency_ms = (
                 self.ended_at - self.started_at
             ).total_seconds() * 1000.0
-        # TODO: Session 3 -- if an exception propagated (exc is not None) and
-        # record_failure/record_success was never called, classify it here.
-        return False
+        # If an exception is leaving this block and the caller never classified
+        # it (record_success / record_failure both set ``outcome``, so an unset
+        # ``outcome`` means neither ran), record it as a non-retryable failure
+        # rather than let it pass through with the attempt looking unfinished.
+        if exc is not None and self.outcome is None:
+            self.outcome = "non_retryable_error"
+            self.error_type = type(exc).__name__
+            self.error_message = str(exc)
+        return False  # never suppress the caller's exception
 
     def record_success(
         self,
+        response,
         *,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
-        cost_usd: float | None = None,
     ) -> None:
-        """Mark this attempt successful and store token/cost data.
+        """Mark this attempt successful and store the token counts.
 
-        Stub -- Session 3 owns the real logic (set ``outcome = "success"``,
-        store the numbers, signal the parent trace to stop retrying).
+        ``response`` (the provider's response object) is accepted for a stable
+        call signature but not persisted -- there is no field for it. Session 7
+        may read usage figures off it.
         """
-        raise NotImplementedError("Session 3")
+        self.outcome = "success"
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        # cost_usd stays None. TODO: Session 7 -- wire in pricing.py to turn the
+        # token counts + provider/model into a dollar figure here.
 
-    def record_failure(
-        self,
-        *,
-        error_type: str | None = None,
-        error_message: str | None = None,
-        retryable: bool,
-    ) -> None:
-        """Mark this attempt failed.
+    def record_failure(self, error, *, retryable: bool) -> None:
+        """Mark this attempt failed, using the caller's own classification.
 
         ``retryable=True`` -> ``outcome = "retryable_error"`` (the trace may try
         the next provider); ``retryable=False`` -> ``outcome =
-        "non_retryable_error"`` (the trace stops).
-
-        Stub -- Session 3 owns the branching and the exhaustion detection.
+        "non_retryable_error"`` (the caller is expected to re-raise).
         """
-        raise NotImplementedError("Session 3")
+        self.outcome = "retryable_error" if retryable else "non_retryable_error"
+        self.error_type = type(error).__name__
+        self.error_message = str(error)
 
 
 @dataclass(kw_only=True)
@@ -118,13 +127,14 @@ class Trace:
     Used as a context manager::
 
         with Trace() as trace:
-            with trace.attempt("openai", "gpt-4o") as attempt:
-                ...
+            for provider in providers:
+                with trace.attempt(provider=provider, model=model) as attempt:
+                    ...
 
-    ``__enter__`` stamps ``started_at``; ``__exit__`` stamps ``ended_at``. The
-    roll-up fields (``final_status``, ``winning_provider``, ``total_cost_usd``,
-    ``total_latency_ms``, ``retry_count``) are computed in Session 3 and are
-    left unset / zeroed here.
+    ``__enter__`` stamps ``started_at``. ``__exit__`` stamps ``ended_at`` and
+    then finalizes the roll-up fields (:meth:`_finalize`) -- this runs whether
+    or not an exception is propagating out of the ``with`` block, and never
+    suppresses one.
     """
 
     trace_id: str = field(default_factory=_new_id)
@@ -143,10 +153,30 @@ class Trace:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.ended_at = _now()
-        # TODO: Session 3 -- aggregate self.attempts into final_status
-        # ("success" vs "exhausted"), winning_provider, total_cost_usd,
-        # total_latency_ms and retry_count.
-        return False
+        # Finalize bookkeeping even when a non-retryable failure is about to
+        # raise out of the whole ``with Trace():`` block.
+        self._finalize()
+        return False  # never suppress the caller's exception
+
+    def _finalize(self) -> None:
+        """Aggregate ``self.attempts`` into the roll-up fields."""
+        winner = next(
+            (a for a in self.attempts if a.outcome == "success"), None
+        )
+        # Only two end states exist: a success happened, or it didn't. "Didn't"
+        # covers both running out of retryable options and hitting a
+        # non-retryable error.
+        self.final_status = "success" if winner is not None else "exhausted"
+        self.winning_provider = winner.provider if winner is not None else None
+        # Retries = attempts beyond the first.
+        self.retry_count = max(len(self.attempts) - 1, 0)
+        # Total time spent across the whole cascade, retry overhead included --
+        # the sum of the attempts' own latencies, deliberately NOT the trace's
+        # wall-clock duration (which would hide time lost to retries).
+        self.total_latency_ms = sum(a.latency_ms or 0.0 for a in self.attempts)
+        # Sum of per-attempt cost, treating None as 0.0. Every cost_usd is None
+        # until Session 7 lands pricing.py, so this is correctly 0.0 for now.
+        self.total_cost_usd = sum(a.cost_usd or 0.0 for a in self.attempts)
 
     def attempt(self, provider: str, model: str) -> Attempt:
         """Create the next :class:`Attempt` for this trace and return it.
