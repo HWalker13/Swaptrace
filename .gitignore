@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Benchmark output: ad-hoc runs stay local; a canonical result is added with `git add -f`.
+benchmarks/results/*.json
