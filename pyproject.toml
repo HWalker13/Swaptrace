@@ -20,6 +20,9 @@ classifiers = [
 dev = ["pytest"]
 swapllm = ["swapllm>=0.1.0"]
 
+[project.scripts]
+swaptrace = "swaptrace.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
