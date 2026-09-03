@@ -23,8 +23,20 @@ Deliberately NOT measured: the swapLLM adapter (this is about the core layer in
 isolation) and ``storage.append_trace`` (disk I/O has its own highly variable
 cost; folding it in would make the number meaningless).
 
+Framing the number
+------------------
+swaptrace's overhead is a fixed cost of its own bookkeeping (a couple of
+``uuid4()`` calls, ``datetime.now()`` calls, the ``_finalize()`` rollup, the
+pricing dict merge) -- it does not depend on what the wrapped call does. So the
+honest way to state it is as a fraction of a *real* LLM API call latency
+(``REFERENCE_LATENCIES_S``: 100 ms - 2 s), computed by arithmetic from the
+measured absolute overhead. The ratio against this script's no-op baseline is
+also recorded but is not representative -- the baseline is a function that just
+returns a string.
+
 Run: ``python benchmarks/benchmark_overhead.py``
-Stdlib only: ``gc``, ``json``, ``platform``, ``statistics``, ``time``.
+Stdlib only: ``gc``, ``json``, ``platform``, ``re``, ``statistics``, ``time``,
+``datetime``, ``pathlib``.
 """
 
 from __future__ import annotations
@@ -43,6 +55,12 @@ from swaptrace import Trace
 N_WARMUP = 100
 N_ITERATIONS = 1000
 N_TRIALS = 5
+
+# Realistic LLM API call latencies to express the overhead against (seconds).
+# 100 ms - 2 s spans fast small models to slow large ones. No calls are actually
+# made at these latencies -- the percentages are pure arithmetic on the measured
+# absolute overhead.
+REFERENCE_LATENCIES_S = [0.1, 0.2, 0.5, 1.0, 2.0]
 
 _RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -143,16 +161,38 @@ def main() -> None:
     overhead = {
         "median_abs_s": overhead_median_s,
         "median_abs_us": overhead_median_s * 1e6,
-        "median_pct_of_baseline": overhead_median_s / untraced_pooled["median_s"] * 100,
         "p95_abs_s": overhead_p95_s,
         "p95_abs_us": overhead_p95_s * 1e6,
         "mean_abs_s": overhead_mean_s,
         "mean_abs_us": overhead_mean_s * 1e6,
+        # Overhead as a fraction of a real LLM API call latency. THIS is the
+        # headline framing.
+        "pct_of_realistic_latency": {
+            "reference_latencies_s": REFERENCE_LATENCIES_S,
+            "median": {
+                f"{r}s": overhead_median_s / r * 100 for r in REFERENCE_LATENCIES_S
+            },
+            "p95": {
+                f"{r}s": overhead_p95_s / r * 100 for r in REFERENCE_LATENCIES_S
+            },
+        },
+        # Ratio against this script's no-op baseline (~0.04 us). Recorded for
+        # completeness, but NOT representative of real-world overhead -- the
+        # baseline is a function that just returns a string. Use
+        # pct_of_realistic_latency instead.
+        "pct_of_synthetic_zero_cost_baseline": {
+            "median": overhead_median_s / untraced_pooled["median_s"] * 100,
+            "p95": overhead_p95_s / untraced_pooled["p95_s"] * 100,
+            "note": (
+                "NOT representative of real-world overhead -- baseline is a "
+                "no-op function; see pct_of_realistic_latency"
+            ),
+        },
     }
 
     payload = {
         "kind": "swaptrace-instrumentation-overhead",
-        "status": "preliminary-smoke-test",  # Session 16 does the final run
+        "status": "final",
         "timestamp_utc": when.isoformat(),
         "config": {
             "n_warmup": N_WARMUP,
@@ -182,7 +222,7 @@ def main() -> None:
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     us = lambda s: f"{s * 1e6:9.3f} us"  # noqa: E731 -- local formatting shortcut
-    print("swaptrace instrumentation overhead (PRELIMINARY smoke test)")
+    print(f"swaptrace instrumentation overhead ({payload['status']})")
     print("=" * 62)
     print(f"  python   : {info['python_implementation']} {info['python_version']}")
     print(f"  platform : {info['platform']}")
@@ -196,9 +236,20 @@ def main() -> None:
     print(f"  {'traced':>10}  {us(traced_pooled['median_s'])}  "
           f"{us(traced_pooled['p95_s'])}  {us(traced_pooled['mean_s'])}")
     print()
-    print(f"  overhead : {overhead['median_abs_us']:.3f} us/call at the median "
-          f"({overhead['median_pct_of_baseline']:.1f}% of baseline)")
-    print(f"             {overhead['p95_abs_us']:.3f} us/call at p95")
+    print(f"  ABSOLUTE overhead : {overhead['median_abs_us']:.3f} us/call median, "
+          f"{overhead['p95_abs_us']:.3f} us/call p95")
+    print()
+    print("  as % of a realistic LLM API call latency  (the headline framing):")
+    print(f"      {'call latency':>14}  {'median':>10}  {'p95':>10}")
+    for r in REFERENCE_LATENCIES_S:
+        key = f"{r}s"
+        print(f"      {str(int(r * 1000)) + ' ms':>14}  "
+              f"{overhead['pct_of_realistic_latency']['median'][key]:>9.4f}%  "
+              f"{overhead['pct_of_realistic_latency']['p95'][key]:>9.4f}%")
+    print()
+    synth = overhead["pct_of_synthetic_zero_cost_baseline"]
+    print(f"  (synthetic no-op-baseline ratio: {synth['median']:.0f}% median -- "
+          "NOT representative; baseline is a no-op fn)")
     print()
     print("  per-trial traced medians (us):",
           ", ".join(f"{t['median_s'] * 1e6:.3f}" for t in traced_per_trial))
