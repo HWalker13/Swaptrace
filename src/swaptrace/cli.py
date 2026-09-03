@@ -1,8 +1,12 @@
 """``swaptrace`` command-line interface.
 
-One subcommand so far: ``swaptrace query`` -- read a JSONL trace file and print
-the traces that match some filters. (``swaptrace report`` arrives in a later
-session; argparse subparsers are added incrementally.)
+Subcommands:
+
+* ``swaptrace query`` -- read a JSONL trace file and print the *traces* that
+  match some filters.
+* ``swaptrace report --compare-providers`` -- flatten every *attempt* across
+  every trace, group by provider, and print a reliability / latency / cost
+  comparison.
 
 Trace files
 -----------
@@ -28,11 +32,19 @@ Stdlib only: ``argparse``, ``pathlib``.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 
-from swaptrace.core import Trace
+from swaptrace.core import Attempt, Trace
 from swaptrace.storage import read_traces
 
-__all__ = ["main", "build_parser", "trace_matches", "DEFAULT_TRACE_PATH"]
+__all__ = [
+    "main",
+    "build_parser",
+    "trace_matches",
+    "compare_providers",
+    "ProviderStats",
+    "DEFAULT_TRACE_PATH",
+]
 
 # Where ``swaptrace query`` looks by default. Relative to the working directory:
 # traces are meaningful per-project (which app, which repo), not global -- the
@@ -102,6 +114,99 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# report --compare-providers
+# --------------------------------------------------------------------------- #
+@dataclass
+class ProviderStats:
+    """Per-provider aggregate over every attempt that used it. Derived and
+    thrown away after printing -- not part of the persisted data model.
+    """
+
+    provider: str
+    total_attempts: int
+    successes: int
+    success_rate: float  # successes / total_attempts
+    avg_latency_ms: float  # mean over ALL attempts, success or failure
+    total_cost_usd: float  # sum of cost_usd, None treated as 0.0
+    avg_cost_per_success_usd: float | None  # None when successes == 0
+
+
+def compare_providers(traces: list[Trace]) -> list[ProviderStats]:
+    """Flatten every attempt across ``traces``, group by ``attempt.provider``,
+    and return one :class:`ProviderStats` per provider, sorted by
+    ``success_rate`` descending (ties broken by provider name).
+    """
+    groups: dict[str, list[Attempt]] = {}
+    for trace in traces:
+        for attempt in trace.attempts:
+            groups.setdefault(attempt.provider, []).append(attempt)
+
+    stats: list[ProviderStats] = []
+    for provider, attempts in groups.items():
+        total = len(attempts)
+        successes = sum(1 for a in attempts if a.outcome == "success")
+        latencies = [a.latency_ms for a in attempts if a.latency_ms is not None]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+        total_cost = sum(a.cost_usd or 0.0 for a in attempts)
+        stats.append(
+            ProviderStats(
+                provider=provider,
+                total_attempts=total,
+                successes=successes,
+                success_rate=successes / total,
+                avg_latency_ms=avg_latency,
+                total_cost_usd=total_cost,
+                avg_cost_per_success_usd=(
+                    total_cost / successes if successes else None
+                ),
+            )
+        )
+    stats.sort(key=lambda s: (-s.success_rate, s.provider))
+    return stats
+
+
+_REPORT_COLUMNS = ("PROVIDER", "ATTEMPTS", "SUCCESSES", "SUCCESS%", "AVG LATENCY", "TOTAL COST", "$/SUCCESS")
+
+
+def _report_row(provider, attempts, successes, success_pct, latency, total_cost, per_success) -> str:
+    return (
+        f"{provider:<12}{attempts:>9}{successes:>11}{success_pct:>10}"
+        f"{latency:>14}{total_cost:>14}{per_success:>13}"
+    )
+
+
+def _format_stats_row(s: ProviderStats) -> str:
+    per_success = (
+        "-"
+        if s.avg_cost_per_success_usd is None
+        else f"${s.avg_cost_per_success_usd:.6f}"
+    )
+    return _report_row(
+        s.provider,
+        s.total_attempts,
+        s.successes,
+        f"{s.success_rate * 100:.1f}%",
+        f"{s.avg_latency_ms:.1f}ms",
+        f"${s.total_cost_usd:.6f}",
+        per_success,
+    )
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    if not args.compare_providers:
+        print("No report type specified. Try --compare-providers.")
+        return 2
+    stats = compare_providers(read_traces(args.path))
+    if not stats:
+        print("No traces found.")
+        return 0
+    print(_report_row(*_REPORT_COLUMNS))
+    for row in stats:
+        print(_format_stats_row(row))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="swaptrace", description="Trace and compare LLM swap attempts."
@@ -140,6 +245,27 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="USD",
         help="keep traces whose total_cost_usd is >= this value",
     )
+
+    report = subparsers.add_parser(
+        "report",
+        help="aggregate stats across traces",
+        description=(
+            "Aggregate statistics across a JSONL trace file. Prints 'No traces "
+            "found.' when the file is missing or empty. Currently one mode: "
+            "--compare-providers."
+        ),
+    )
+    report.add_argument(
+        "--path",
+        default=DEFAULT_TRACE_PATH,
+        help=f"trace file to read (default: {DEFAULT_TRACE_PATH})",
+    )
+    report.add_argument(
+        "--compare-providers",
+        action="store_true",
+        help="per-provider reliability / latency / cost comparison, "
+        "sorted by success rate",
+    )
     return parser
 
 
@@ -150,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "query":
         return cmd_query(args)
-    return 1  # unreachable while ``query`` is the only subcommand
+    if args.command == "report":
+        return cmd_report(args)
+    return 1  # unreachable -- subparsers are required
 
 
 if __name__ == "__main__":
