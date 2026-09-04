@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swaptrace"
-version = "0.0.1"
+version = "0.1.0"
 description = "Trace and compare LLM swap attempts."
 readme = "README.md"
 requires-python = ">=3.11"
